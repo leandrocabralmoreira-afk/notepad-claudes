@@ -1,0 +1,36 @@
+name: Build Notepad4 portatil
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compilar (x64 Release)
+        shell: cmd
+        run: |
+          cd build\VisualStudio
+          msbuild Notepad4.sln /nologo /t:Notepad4 /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+      - name: Montar pacote portatil
+        shell: pwsh
+        run: |
+          $out = "Notepad4-Portatil"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item "bin\Release\x64\Notepad4.exe" $out
+          Copy-Item "portatil\Notepad4.ini" $out
+          Copy-Item "portatil\LEIAME.txt" $out
+          Compress-Archive -Path "$out\*" -DestinationPath "Notepad4-Portatil-x64.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Notepad4-Portatil-x64
+          path: Notepad4-Portatil-x64.zip

@@ -1,0 +1,1221 @@
+
+--- a/src/EditLexers/stlDefault.cpp	2026-10-23 21:04:16.197868687 +0000
++++ b/src/EditLexers/stlDefault.cpp	2026-10-23 21:04:16.377111885 +0000
+@@ -19,7 +19,7 @@
+ 	{ SC_ELEMENT_CARET, NP2StyleX_Caret, L"back:#FF0000" },
+ 	{ INDICATOR_IME, NP2StyleX_IMEIndicator, L"fore:#108010" },
+ 	{ SCI_SETEDGECOLOUR, NP2StyleX_LongLineMarker, L"fore:#FFC000" },
+-	{ SCI_SETEXTRAASCENT + SCI_SETEXTRADESCENT, NP2StyleX_ExtraLineSpacing, L"size:2" },
++	{ SCI_SETEXTRAASCENT + SCI_SETEXTRADESCENT, NP2StyleX_ExtraLineSpacing, L"size:0" },
+ 	{ 0, NP2StyleX_CodeFolding, L"" },
+ 	{ SC_MARKNUM_FOLDER, NP2StyleX_FoldingMarker, L"fore:#8080FF; back:#ADD8E6" },
+ 	{ STYLE_FOLDDISPLAYTEXT, NP2StyleX_FoldEllipsis, L"font:$(Code); size:-2; bold; fore:#808080" },
+
+--- a/src/FormatBar.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/FormatBar.h	2026-10-23 21:05:12.211850615 +0000
+@@ -0,0 +1,1125 @@
++// FormatBar.h
++// Barra flutuante de formatacao (estilo editor de notas Markdown) para o Notepad4.
++// Incluido diretamente por Notepad4.cpp (nao precisa alterar o projeto).
++//
++// Recursos:
++//  - Ao selecionar texto aparece uma barra com: Realce, Negrito, Italico, Sublinhado,
++//    Marcadores, Lista numerada, Tachado e Limpar formatacao.
++//  - Clicar uma segunda vez no mesmo botao remove a formatacao (toggle).
++//  - Realce (<mark>) e Sublinhado (<u>) sao exibidos ao vivo por indicadores do Scintilla;
++//    negrito/italico/tachado ja sao exibidos pelo lexer de Markdown.
++//  - Ctrl+V com uma imagem na area de transferencia insere ![imagem](data:image/png;base64,...)
++#pragma once
++
++#define ID_FORMATBARTIMER	0xA003
++
++#define IndicatorNumber_FormatUnderline		(INDICATOR_CONTAINER + 3)
++#define IndicatorNumber_FormatHighlight		(INDICATOR_CONTAINER + 4)
++
++enum {
++	FormatBtn_Highlight,
++	FormatBtn_Bold,
++	FormatBtn_Italic,
++	FormatBtn_Underline,
++	FormatBtn_Bullets,
++	FormatBtn_Numbers,
++	FormatBtn_Strike,
++	FormatBtn_Clear,
++	FormatBtn_Count
++};
++
++enum {
++	FormatKind_Bold,
++	FormatKind_Italic,
++	FormatKind_Strike,
++	FormatKind_Underline,
++	FormatKind_Highlight
++};
++
++static HWND hwndFormatBar = nullptr;
++static HWND hwndFormatTip = nullptr;
++static HFONT hFormatFont[4] = {}; // normal, bold, italic, small
++static UINT uFormatFontDpi = 0;
++static int iFormatPressed = -1;
++
++static inline bool FormatBar_IsActiveLexer() noexcept {
++	return pLexCurrent->rid == NP2LEX_MARKDOWN || pLexCurrent->rid == NP2LEX_TEXTFILE;
++}
++
++static inline UINT FormatBar_Dpi() noexcept {
++	return g_uCurrentDPI ? g_uCurrentDPI : 96;
++}
++
++//=============================================================================
++// Marcadores
++//=============================================================================
++static void FormatBar_GetMarks(int kind, const char *&open, const char *&close) noexcept {
++	switch (kind) {
++	case FormatKind_Bold:
++		open = close = "**";
++		break;
++	case FormatKind_Italic:
++		open = close = "*";
++		break;
++	case FormatKind_Strike:
++		open = close = "~~";
++		break;
++	case FormatKind_Underline:
++		open = "<u>";
++		close = "</u>";
++		break;
++	default:
++		open = "<mark>";
++		close = "</mark>";
++		break;
++	}
++}
++
++static bool FormatBar_Match(Sci_Position pos, const char *s) noexcept {
++	const Sci_Position len = static_cast<Sci_Position>(strlen(s));
++	if (pos < 0 || pos + len > SciCall_GetLength()) {
++		return false;
++	}
++	for (Sci_Position i = 0; i < len; i++) {
++		if (static_cast<char>(SciCall_GetCharAt(pos + i)) != s[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static int FormatBar_StarsBefore(Sci_Position pos, int limit) noexcept {
++	int n = 0;
++	while (n < limit && pos - n - 1 >= 0 && SciCall_GetCharAt(pos - n - 1) == '*') {
++		n++;
++	}
++	return n;
++}
++
++static int FormatBar_StarsAfter(Sci_Position pos, int limit) noexcept {
++	int n = 0;
++	const Sci_Position length = SciCall_GetLength();
++	while (n < limit && pos + n < length && SciCall_GetCharAt(pos + n) == '*') {
++		n++;
++	}
++	return n;
++}
++
++static inline void FormatBar_Delete(Sci_Position start, Sci_Position end) noexcept {
++	SciCall_SetTargetRange(start, end);
++	SciCall_ReplaceTarget(0, "");
++}
++
++// 0 = sem formatacao, 1 = marcadores fora do trecho, 2 = marcadores dentro do trecho
++static int FormatBar_SegmentState(int kind, Sci_Position s, Sci_Position e) noexcept {
++	const char *open;
++	const char *close;
++	FormatBar_GetMarks(kind, open, close);
++	const Sci_Position lo = static_cast<Sci_Position>(strlen(open));
++	const Sci_Position lc = static_cast<Sci_Position>(strlen(close));
++
++	if (kind == FormatKind_Bold || kind == FormatKind_Italic) {
++		const int need = (kind == FormatKind_Bold) ? 2 : 1;
++		// fora
++		int m = min(FormatBar_StarsBefore(s, 3), FormatBar_StarsAfter(e, 3));
++		if ((kind == FormatKind_Bold) ? (m >= 2) : (m == 1 || m == 3)) {
++			return 1;
++		}
++		// dentro
++		const Sci_Position len = e - s;
++		int ln = 0;
++		int tn = 0;
++		while (ln < 3 && ln < len && SciCall_GetCharAt(s + ln) == '*') {
++			ln++;
++		}
++		while (tn < 3 && tn < len && SciCall_GetCharAt(e - tn - 1) == '*') {
++			tn++;
++		}
++		m = min(min(ln, tn), static_cast<int>((len - 1) / 2));
++		if ((kind == FormatKind_Bold) ? (m >= 2) : (m == 1 || m == 3)) {
++			return 2;
++		}
++		(void)need;
++		return 0;
++	}
++
++	if (FormatBar_Match(s - lo, open) && FormatBar_Match(e, close)) {
++		return 1;
++	}
++	if (e - s >= lo + lc && FormatBar_Match(s, open) && FormatBar_Match(e - lc, close)) {
++		return 2;
++	}
++	return 0;
++}
++
++// aplica/remove marcadores em um trecho; devolve variacao de tamanho
++static Sci_Position FormatBar_SegmentApply(int kind, Sci_Position s, Sci_Position e, bool remove,
++	Sci_Position &startShift, Sci_Position &endShift) noexcept {
++	const char *open;
++	const char *close;
++	FormatBar_GetMarks(kind, open, close);
++	const Sci_Position lo = static_cast<Sci_Position>(strlen(open));
++	const Sci_Position lc = static_cast<Sci_Position>(strlen(close));
++	startShift = 0;
++	endShift = 0;
++	if (remove) {
++		const int state = FormatBar_SegmentState(kind, s, e);
++		if (state == 1) {
++			FormatBar_Delete(e, e + lc);
++			FormatBar_Delete(s - lo, s);
++			startShift = -lo;
++			endShift = -lo;
++			return -(lo + lc);
++		}
++		if (state == 2) {
++			FormatBar_Delete(e - lc, e);
++			FormatBar_Delete(s, s + lo);
++			startShift = 0;
++			endShift = -(lo + lc);
++			return -(lo + lc);
++		}
++		return 0;
++	}
++	SciCall_InsertText(e, close);
++	SciCall_InsertText(s, open);
++	startShift = lo;
++	endShift = lo;
++	return lo + lc;
++}
++
++struct FormatBarSegment {
++	Sci_Position start;
++	Sci_Position end;
++};
++
++static void FormatBar_GetLineRange(Sci_Position selStart, Sci_Position selEnd, Sci_Line &l0, Sci_Line &l1) noexcept {
++	l0 = SciCall_LineFromPosition(selStart);
++	l1 = SciCall_LineFromPosition(selEnd);
++	if (l1 > l0 && selEnd == SciCall_PositionFromLine(l1)) {
++		l1--;
++	}
++}
++
++static inline bool FormatBar_IsBlank(int ch) noexcept {
++	return ch == ' ' || ch == '\t';
++}
++
++static void FormatBar_ToggleInline(int kind) noexcept {
++	if (SciCall_GetReadOnly() || SciCall_IsSelectionEmpty()) {
++		return;
++	}
++	const Sci_Position selStart = SciCall_GetSelectionStart();
++	const Sci_Position selEnd = SciCall_GetSelectionEnd();
++	Sci_Line l0;
++	Sci_Line l1;
++	FormatBar_GetLineRange(selStart, selEnd, l0, l1);
++	const Sci_Line lineCount = l1 - l0 + 1;
++	FormatBarSegment *segs = static_cast<FormatBarSegment *>(NP2HeapAlloc(static_cast<SIZE_T>(lineCount) * sizeof(FormatBarSegment)));
++	if (segs == nullptr) {
++		return;
++	}
++
++	Sci_Line count = 0;
++	bool allFormatted = true;
++	for (Sci_Line line = l0; line <= l1; line++) {
++		Sci_Position s = max<Sci_Position>(selStart, SciCall_PositionFromLine(line));
++		Sci_Position e = min<Sci_Position>(selEnd, SciCall_GetLineEndPosition(line));
++		while (s < e && FormatBar_IsBlank(SciCall_GetCharAt(s))) {
++			s++;
++		}
++		while (e > s && FormatBar_IsBlank(SciCall_GetCharAt(e - 1))) {
++			e--;
++		}
++		if (s >= e) {
++			continue;
++		}
++		segs[count].start = s;
++		segs[count].end = e;
++		count++;
++		if (FormatBar_SegmentState(kind, s, e) == 0) {
++			allFormatted = false;
++		}
++	}
++
++	if (count == 0) {
++		NP2HeapFree(segs);
++		return;
++	}
++
++	SciCall_BeginUndoAction();
++	Sci_Position firstStartShift = 0;
++	Sci_Position lastEndShift = 0;
++	Sci_Position deltaBeforeLast = 0;
++	for (Sci_Line i = count - 1; i >= 0; i--) {
++		Sci_Position startShift = 0;
++		Sci_Position endShift = 0;
++		Sci_Position delta = 0;
++		if (allFormatted) {
++			delta = FormatBar_SegmentApply(kind, segs[i].start, segs[i].end, true, startShift, endShift);
++		} else if (FormatBar_SegmentState(kind, segs[i].start, segs[i].end) == 0) {
++			delta = FormatBar_SegmentApply(kind, segs[i].start, segs[i].end, false, startShift, endShift);
++		}
++		if (i == 0) {
++			firstStartShift = startShift;
++		}
++		if (i == count - 1) {
++			lastEndShift = endShift;
++		} else {
++			deltaBeforeLast += delta;
++		}
++	}
++	SciCall_EndUndoAction();
++	SciCall_SetSel(segs[0].start + firstStartShift, segs[count - 1].end + deltaBeforeLast + lastEndShift);
++	NP2HeapFree(segs);
++}
++
++//=============================================================================
++// Listas (marcadores / numerada)
++//=============================================================================
++// tipo: 0 = nenhum, 1 = marcador, 2 = numerado
++static int FormatBar_ParseMarker(const char *p, const char *end, int &indentLen, int &markerLen) noexcept {
++	const char *q = p;
++	while (q < end && (*q == ' ' || *q == '\t')) {
++		q++;
++	}
++	indentLen = static_cast<int>(q - p);
++	markerLen = 0;
++	if (q + 1 < end && (*q == '-' || *q == '*' || *q == '+') && (q[1] == ' ' || q[1] == '\t')) {
++		markerLen = 2;
++		return 1;
++	}
++	const char *d = q;
++	while (d < end && *d >= '0' && *d <= '9') {
++		d++;
++	}
++	if (d != q && d - q <= 9 && d + 1 < end && (*d == '.' || *d == ')') && (d[1] == ' ' || d[1] == '\t')) {
++		markerLen = static_cast<int>(d - q) + 2;
++		return 2;
++	}
++	return 0;
++}
++
++static void FormatBar_ToggleList(bool numbered) noexcept {
++	if (SciCall_GetReadOnly()) {
++		return;
++	}
++	const Sci_Position selStart = SciCall_GetSelectionStart();
++	const Sci_Position selEnd = SciCall_GetSelectionEnd();
++	Sci_Line l0;
++	Sci_Line l1;
++	FormatBar_GetLineRange(selStart, selEnd, l0, l1);
++	const Sci_Position rangeStart = SciCall_PositionFromLine(l0);
++	const Sci_Position rangeEnd = SciCall_GetLineEndPosition(l1);
++	const Sci_Position length = rangeEnd - rangeStart;
++	const Sci_Line lineCount = l1 - l0 + 1;
++	if (length <= 0) {
++		// linha vazia: apenas insere o marcador
++		SciCall_BeginUndoAction();
++		SciCall_InsertText(rangeStart, numbered ? "1. " : "- ");
++		SciCall_EndUndoAction();
++		const Sci_Position pos = rangeStart + (numbered ? 3 : 2);
++		SciCall_SetSel(pos, pos);
++		return;
++	}
++
++	char *src = static_cast<char *>(NP2HeapAlloc(static_cast<SIZE_T>(length) + 1));
++	char *dst = static_cast<char *>(NP2HeapAlloc(static_cast<SIZE_T>(length) + static_cast<SIZE_T>(lineCount) * 16 + 16));
++	if (src == nullptr || dst == nullptr) {
++		if (src) {
++			NP2HeapFree(src);
++		}
++		if (dst) {
++			NP2HeapFree(dst);
++		}
++		return;
++	}
++	const Sci_TextRangeFull tr = { { rangeStart, rangeEnd }, src };
++	SciCall_GetTextRangeFull(&tr);
++
++	const int wanted = numbered ? 2 : 1;
++	// 1a passada: todas as linhas nao vazias ja tem o marcador pedido?
++	bool allHave = true;
++	{
++		const char *p = src;
++		const char *const stop = src + length;
++		while (p <= stop) {
++			const char *eol = p;
++			while (eol < stop && *eol != '\r' && *eol != '\n') {
++				eol++;
++			}
++			int indent = 0;
++			int mlen = 0;
++			const int type = FormatBar_ParseMarker(p, eol, indent, mlen);
++			bool blank = true;
++			for (const char *c = p; c < eol; c++) {
++				if (*c != ' ' && *c != '\t') {
++					blank = false;
++					break;
++				}
++			}
++			if (!blank && type != wanted) {
++				allHave = false;
++				break;
++			}
++			if (eol >= stop) {
++				break;
++			}
++			p = eol + ((eol[0] == '\r' && eol + 1 < stop && eol[1] == '\n') ? 2 : 1);
++		}
++	}
++
++	// 2a passada: gera o texto
++	char *out = dst;
++	int counter = 1;
++	{
++		const char *p = src;
++		const char *const stop = src + length;
++		while (p <= stop) {
++			const char *eol = p;
++			while (eol < stop && *eol != '\r' && *eol != '\n') {
++				eol++;
++			}
++			int indent = 0;
++			int mlen = 0;
++			const int type = FormatBar_ParseMarker(p, eol, indent, mlen);
++			bool blank = true;
++			for (const char *c = p; c < eol; c++) {
++				if (*c != ' ' && *c != '\t') {
++					blank = false;
++					break;
++				}
++			}
++			if (blank) {
++				memcpy(out, p, static_cast<size_t>(eol - p));
++				out += eol - p;
++			} else {
++				memcpy(out, p, static_cast<size_t>(indent));
++				out += indent;
++				const char *rest = p + indent + mlen; // se type == 0, mlen == 0
++				if (!allHave) {
++					if (numbered) {
++						out += wsprintfA(out, "%d. ", counter++);
++					} else {
++						*out++ = '-';
++						*out++ = ' ';
++					}
++				}
++				if (type == 0) {
++					rest = p + indent;
++				}
++				memcpy(out, rest, static_cast<size_t>(eol - rest));
++				out += eol - rest;
++			}
++			if (eol >= stop) {
++				break;
++			}
++			const int eolLen = (eol[0] == '\r' && eol + 1 < stop && eol[1] == '\n') ? 2 : 1;
++			memcpy(out, eol, static_cast<size_t>(eolLen));
++			out += eolLen;
++			p = eol + eolLen;
++		}
++	}
++
++	const Sci_Position newLen = out - dst;
++	SciCall_BeginUndoAction();
++	SciCall_SetTargetRange(rangeStart, rangeEnd);
++	SciCall_ReplaceTarget(newLen, dst);
++	SciCall_EndUndoAction();
++	SciCall_SetSel(rangeStart, rangeStart + newLen);
++	NP2HeapFree(src);
++	NP2HeapFree(dst);
++}
++
++//=============================================================================
++// Limpar formatacao
++//=============================================================================
++static bool FormatBar_StartsWith(const char *p, const char *end, const char *token, size_t len) noexcept {
++	return static_cast<size_t>(end - p) >= len && memcmp(p, token, len) == 0;
++}
++
++static void FormatBar_ClearFormatting() noexcept {
++	if (SciCall_GetReadOnly() || SciCall_IsSelectionEmpty()) {
++		return;
++	}
++	Sci_Position selStart = SciCall_GetSelectionStart();
++	Sci_Position selEnd = SciCall_GetSelectionEnd();
++
++	// inclui marcadores que estao imediatamente ao redor da selecao
++	static const char *const pairs[][2] = {
++		{ "<mark>", "</mark>" },
++		{ "<u>", "</u>" },
++		{ "~~", "~~" },
++		{ "**", "**" },
++		{ "*", "*" },
++	};
++	for (int guard = 0; guard < 12; guard++) {
++		bool extended = false;
++		for (const auto &pair : pairs) {
++			const Sci_Position lo = static_cast<Sci_Position>(strlen(pair[0]));
++			const Sci_Position lc = static_cast<Sci_Position>(strlen(pair[1]));
++			if (FormatBar_Match(selStart - lo, pair[0]) && FormatBar_Match(selEnd, pair[1])) {
++				selStart -= lo;
++				selEnd += lc;
++				extended = true;
++				break;
++			}
++		}
++		if (!extended) {
++			break;
++		}
++	}
++
++	const Sci_Position length = selEnd - selStart;
++	char *src = static_cast<char *>(NP2HeapAlloc(static_cast<SIZE_T>(length) + 1));
++	char *dst = static_cast<char *>(NP2HeapAlloc(static_cast<SIZE_T>(length) + 1));
++	if (src == nullptr || dst == nullptr) {
++		if (src) {
++			NP2HeapFree(src);
++		}
++		if (dst) {
++			NP2HeapFree(dst);
++		}
++		return;
++	}
++	const Sci_TextRangeFull tr = { { selStart, selEnd }, src };
++	SciCall_GetTextRangeFull(&tr);
++
++	char *out = dst;
++	const char *p = src;
++	const char *const stop = src + length;
++	bool lineStart = true;
++	while (p < stop) {
++		if (lineStart) {
++			lineStart = false;
++			// preserva indentacao, remove marcadores de bloco
++			const char *q = p;
++			while (q < stop && (*q == ' ' || *q == '\t')) {
++				q++;
++			}
++			memcpy(out, p, static_cast<size_t>(q - p));
++			out += q - p;
++			p = q;
++			int indent = 0;
++			int mlen = 0;
++			if (FormatBar_ParseMarker(p, stop, indent, mlen) != 0 && indent == 0) {
++				p += mlen;
++			} else if (*p == '#') {
++				const char *h = p;
++				while (h < stop && *h == '#') {
++					h++;
++				}
++				if (h - p <= 6 && h < stop && *h == ' ') {
++					p = h + 1;
++				}
++			} else if (*p == '>') {
++				p++;
++				if (p < stop && *p == ' ') {
++					p++;
++				}
++			}
++			continue;
++		}
++		if (*p == '\r' || *p == '\n') {
++			*out++ = *p++;
++			lineStart = true;
++			continue;
++		}
++		if (*p == '<') {
++			if (FormatBar_StartsWith(p, stop, "<mark>", 6)) {
++				p += 6;
++				continue;
++			}
++			if (FormatBar_StartsWith(p, stop, "</mark>", 7)) {
++				p += 7;
++				continue;
++			}
++			if (FormatBar_StartsWith(p, stop, "<u>", 3)) {
++				p += 3;
++				continue;
++			}
++			if (FormatBar_StartsWith(p, stop, "</u>", 4)) {
++				p += 4;
++				continue;
++			}
++		}
++		if (*p == '*') {
++			p++;
++			continue;
++		}
++		if (*p == '~' && p + 1 < stop && p[1] == '~') {
++			p += 2;
++			continue;
++		}
++		*out++ = *p++;
++	}
++
++	const Sci_Position newLen = out - dst;
++	SciCall_BeginUndoAction();
++	SciCall_SetTargetRange(selStart, selEnd);
++	SciCall_ReplaceTarget(newLen, dst);
++	SciCall_EndUndoAction();
++	SciCall_SetSel(selStart, selStart + newLen);
++	NP2HeapFree(src);
++	NP2HeapFree(dst);
++}
++
++static void FormatBar_Execute(int button) noexcept {
++	switch (button) {
++	case FormatBtn_Highlight:
++		FormatBar_ToggleInline(FormatKind_Highlight);
++		break;
++	case FormatBtn_Bold:
++		FormatBar_ToggleInline(FormatKind_Bold);
++		break;
++	case FormatBtn_Italic:
++		FormatBar_ToggleInline(FormatKind_Italic);
++		break;
++	case FormatBtn_Underline:
++		FormatBar_ToggleInline(FormatKind_Underline);
++		break;
++	case FormatBtn_Bullets:
++		FormatBar_ToggleList(false);
++		break;
++	case FormatBtn_Numbers:
++		FormatBar_ToggleList(true);
++		break;
++	case FormatBtn_Strike:
++		FormatBar_ToggleInline(FormatKind_Strike);
++		break;
++	case FormatBtn_Clear:
++		FormatBar_ClearFormatting();
++		break;
++	default:
++		break;
++	}
++	SetFocus(hwndEdit);
++}
++
++//=============================================================================
++// Indicadores (exibicao de <u> e <mark>)
++//=============================================================================
++static void FormatBar_ApplyIndicator(const char *text, Sci_Position base, int indicator, const char *open, const char *close) noexcept {
++	const size_t lo = strlen(open);
++	const size_t lc = strlen(close);
++	const char *p = text;
++	while (true) {
++		const char *q = strstr(p, open);
++		if (q == nullptr) {
++			break;
++		}
++		const char *content = q + lo;
++		const char *r = strstr(content, close);
++		if (r == nullptr) {
++			break;
++		}
++		if (memchr(content, '\n', static_cast<size_t>(r - content)) == nullptr && r > content) {
++			SciCall_SetIndicatorCurrent(indicator);
++			SciCall_IndicatorFillRange(base + (content - text), r - content);
++		}
++		p = r + lc;
++	}
++}
++
++static void FormatBar_UpdateIndicators() noexcept {
++	static bool initialized = false;
++	if (!initialized) {
++		initialized = true;
++		SciCall_IndicSetStyle(IndicatorNumber_FormatHighlight, INDIC_STRAIGHTBOX);
++		SciCall_IndicSetFore(IndicatorNumber_FormatHighlight, RGB(0xFF, 0xFF, 0x00));
++		SciCall_IndicSetAlpha(IndicatorNumber_FormatHighlight, 255);
++		SciCall(SCI_INDICSETUNDER, IndicatorNumber_FormatHighlight, 1);
++		SciCall_IndicSetStyle(IndicatorNumber_FormatUnderline, INDIC_PLAIN);
++		SciCall_IndicSetFore(IndicatorNumber_FormatUnderline, GetSysColor(COLOR_WINDOWTEXT));
++	}
++
++	const Sci_Line lineCount = SciCall_GetLineCount();
++	const Sci_Line first = SciCall_DocLineFromVisible(SciCall_GetFirstVisibleLine());
++	const Sci_Line onScreen = static_cast<Sci_Line>(SciCall(SCI_LINESONSCREEN, 0, 0));
++	Sci_Line last = first + onScreen + 2;
++	if (last >= lineCount) {
++		last = lineCount - 1;
++	}
++	const Sci_Position startPos = SciCall_PositionFromLine(first);
++	const Sci_Position endPos = SciCall_GetLineEndPosition(last);
++
++	SciCall_SetIndicatorCurrent(IndicatorNumber_FormatHighlight);
++	SciCall_IndicatorClearRange(startPos, endPos - startPos);
++	SciCall_SetIndicatorCurrent(IndicatorNumber_FormatUnderline);
++	SciCall_IndicatorClearRange(startPos, endPos - startPos);
++
++	if (!FormatBar_IsActiveLexer() || endPos <= startPos) {
++		return;
++	}
++	// limita o trabalho em linhas gigantes (por exemplo imagens em Base64)
++	if (endPos - startPos > 2 * 1024 * 1024) {
++		return;
++	}
++	char *buf = static_cast<char *>(NP2HeapAlloc(static_cast<SIZE_T>(endPos - startPos) + 1));
++	if (buf == nullptr) {
++		return;
++	}
++	const Sci_TextRangeFull tr = { { startPos, endPos }, buf };
++	SciCall_GetTextRangeFull(&tr);
++	FormatBar_ApplyIndicator(buf, startPos, IndicatorNumber_FormatHighlight, "<mark>", "</mark>");
++	FormatBar_ApplyIndicator(buf, startPos, IndicatorNumber_FormatUnderline, "<u>", "</u>");
++	NP2HeapFree(buf);
++}
++
++//=============================================================================
++// Janela da barra
++//=============================================================================
++static const WCHAR *const FormatBar_Tips[FormatBtn_Count] = {
++	L"Realce",
++	L"Negrito",
++	L"It\u00E1lico",
++	L"Sublinhado",
++	L"Marcadores",
++	L"Lista numerada",
++	L"Tachado",
++	L"Limpar formata\u00E7\u00E3o",
++};
++
++static inline int FormatBar_ButtonWidth() noexcept {
++	return MulDiv(30, static_cast<int>(FormatBar_Dpi()), 96);
++}
++
++static inline int FormatBar_ButtonHeight() noexcept {
++	return MulDiv(26, static_cast<int>(FormatBar_Dpi()), 96);
++}
++
++static inline int FormatBar_Pad() noexcept {
++	return MulDiv(2, static_cast<int>(FormatBar_Dpi()), 96);
++}
++
++static RECT FormatBar_ButtonRect(int index) noexcept {
++	const int pad = FormatBar_Pad();
++	const int w = FormatBar_ButtonWidth();
++	const int h = FormatBar_ButtonHeight();
++	RECT rc;
++	rc.left = pad + index * w;
++	rc.top = pad;
++	rc.right = rc.left + w;
++	rc.bottom = rc.top + h;
++	return rc;
++}
++
++static int FormatBar_HitTest(int x, int y) noexcept {
++	for (int i = 0; i < FormatBtn_Count; i++) {
++		const RECT rc = FormatBar_ButtonRect(i);
++		const POINT pt = { x, y };
++		if (PtInRect(&rc, pt)) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static void FormatBar_EnsureFonts() noexcept {
++	const UINT dpi = FormatBar_Dpi();
++	if (hFormatFont[0] != nullptr && uFormatFontDpi == dpi) {
++		return;
++	}
++	for (HFONT &font : hFormatFont) {
++		if (font) {
++			DeleteObject(font);
++			font = nullptr;
++		}
++	}
++	uFormatFontDpi = dpi;
++	const int height = -MulDiv(13, static_cast<int>(dpi), 96);
++	const int small = -MulDiv(8, static_cast<int>(dpi), 96);
++	hFormatFont[0] = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
++	hFormatFont[1] = CreateFontW(height, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
++	hFormatFont[2] = CreateFontW(height, 0, 0, 0, FW_NORMAL, TRUE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
++	hFormatFont[3] = CreateFontW(small, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
++}
++
++static void FormatBar_DrawGlyph(HDC hdc, int index, const RECT &rc, bool pressed) noexcept {
++	RECT r = rc;
++	if (pressed) {
++		OffsetRect(&r, 1, 1);
++	}
++	SetBkMode(hdc, TRANSPARENT);
++	SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
++	const int cx = (r.left + r.right) / 2;
++	const int cy = (r.top + r.bottom) / 2;
++	const int u = max(1, MulDiv(1, static_cast<int>(FormatBar_Dpi()), 96));
++
++	switch (index) {
++	case FormatBtn_Highlight: {
++		RECT box = { cx - 8 * u, cy - 8 * u, cx + 8 * u, cy + 8 * u };
++		HBRUSH hbr = CreateSolidBrush(RGB(0xFF, 0xFF, 0x00));
++		FillRect(hdc, &box, hbr);
++		DeleteObject(hbr);
++		SelectObject(hdc, hFormatFont[0]);
++		DrawTextW(hdc, L"A", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++	} break;
++	case FormatBtn_Bold:
++		SelectObject(hdc, hFormatFont[1]);
++		DrawTextW(hdc, L"B", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++		break;
++	case FormatBtn_Italic:
++		SelectObject(hdc, hFormatFont[2]);
++		DrawTextW(hdc, L"I", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++		break;
++	case FormatBtn_Underline: {
++		SelectObject(hdc, hFormatFont[0]);
++		DrawTextW(hdc, L"U", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++		RECT line = { cx - 4 * u, cy + 8 * u, cx + 5 * u, cy + 9 * u };
++		FillRect(hdc, &line, GetSysColorBrush(COLOR_BTNTEXT));
++	} break;
++	case FormatBtn_Bullets:
++	case FormatBtn_Numbers:
++		for (int row = 0; row < 3; row++) {
++			const int y = cy + (row - 1) * 6 * u;
++			if (index == FormatBtn_Bullets) {
++				RECT dot = { cx - 9 * u, y - u, cx - 6 * u, y + 2 * u };
++				FillRect(hdc, &dot, GetSysColorBrush(COLOR_BTNTEXT));
++			} else {
++				WCHAR digit = static_cast<WCHAR>(L'1' + row);
++				SelectObject(hdc, hFormatFont[3]);
++				RECT dr = { cx - 11 * u, y - 5 * u, cx - 4 * u, y + 5 * u };
++				DrawTextW(hdc, &digit, 1, &dr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++			}
++			RECT line = { cx - 3 * u, y, cx + 9 * u, y + u };
++			FillRect(hdc, &line, GetSysColorBrush(COLOR_BTNTEXT));
++		}
++		break;
++	case FormatBtn_Strike: {
++		SelectObject(hdc, hFormatFont[0]);
++		DrawTextW(hdc, L"S", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++		RECT line = { cx - 6 * u, cy, cx + 7 * u, cy + u };
++		FillRect(hdc, &line, GetSysColorBrush(COLOR_BTNTEXT));
++	} break;
++	default:
++		SelectObject(hdc, hFormatFont[0]);
++		DrawTextW(hdc, L"T", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
++		SelectObject(hdc, hFormatFont[3]);
++		{
++			RECT xr = { cx + 2 * u, cy - u, cx + 12 * u, cy + 10 * u };
++			SetTextColor(hdc, RGB(0xC0, 0x00, 0x00));
++			DrawTextW(hdc, L"x", 1, &xr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
++		}
++		break;
++	}
++}
++
++static LRESULT CALLBACK FormatBar_WndProc(HWND hwnd, UINT umsg, WPARAM wParam, LPARAM lParam) noexcept {
++	switch (umsg) {
++	case WM_MOUSEACTIVATE:
++		return MA_NOACTIVATE;
++
++	case WM_ERASEBKGND:
++		return 1;
++
++	case WM_PAINT: {
++		PAINTSTRUCT ps;
++		HDC hdc = BeginPaint(hwnd, &ps);
++		RECT rc;
++		GetClientRect(hwnd, &rc);
++		FillRect(hdc, &rc, GetSysColorBrush(COLOR_BTNFACE));
++		FormatBar_EnsureFonts();
++		HGDIOBJ oldFont = SelectObject(hdc, hFormatFont[0]);
++		for (int i = 0; i < FormatBtn_Count; i++) {
++			RECT r = FormatBar_ButtonRect(i);
++			const bool pressed = (i == iFormatPressed);
++			DrawEdge(hdc, &r, pressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
++			FormatBar_DrawGlyph(hdc, i, r, pressed);
++		}
++		SelectObject(hdc, oldFont);
++		EndPaint(hwnd, &ps);
++	}
++	return 0;
++
++	case WM_LBUTTONDOWN: {
++		const int index = FormatBar_HitTest(static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)));
++		if (index >= 0) {
++			iFormatPressed = index;
++			SetCapture(hwnd);
++			InvalidateRect(hwnd, nullptr, FALSE);
++		}
++	}
++	return 0;
++
++	case WM_LBUTTONUP: {
++		const int pressed = iFormatPressed;
++		if (pressed >= 0) {
++			iFormatPressed = -1;
++			ReleaseCapture();
++			InvalidateRect(hwnd, nullptr, FALSE);
++			const int index = FormatBar_HitTest(static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)));
++			if (index == pressed) {
++				FormatBar_Execute(index);
++			}
++		}
++	}
++	return 0;
++
++	default:
++		break;
++	}
++	return DefWindowProc(hwnd, umsg, wParam, lParam);
++}
++
++static void FormatBar_Hide() noexcept {
++	if (hwndFormatBar && IsWindowVisible(hwndFormatBar)) {
++		ShowWindow(hwndFormatBar, SW_HIDE);
++	}
++}
++
++static bool FormatBar_Create() noexcept {
++	if (hwndFormatBar) {
++		return true;
++	}
++	WNDCLASSEX wc = {};
++	wc.cbSize = sizeof(WNDCLASSEX);
++	wc.style = CS_DROPSHADOW;
++	wc.lpfnWndProc = FormatBar_WndProc;
++	wc.hInstance = g_hInstance;
++	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
++	wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
++	wc.lpszClassName = L"Notepad4FormatBar";
++	RegisterClassEx(&wc);
++
++	const int pad = FormatBar_Pad();
++	const int width = FormatBar_ButtonWidth() * FormatBtn_Count + pad * 2;
++	const int height = FormatBar_ButtonHeight() + pad * 2;
++	hwndFormatBar = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"",
++		WS_POPUP | WS_BORDER, 0, 0, width, height, hwndMain, nullptr, g_hInstance, nullptr);
++	if (hwndFormatBar == nullptr) {
++		return false;
++	}
++
++	hwndFormatTip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
++		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, hwndFormatBar, nullptr, g_hInstance, nullptr);
++	if (hwndFormatTip) {
++		for (int i = 0; i < FormatBtn_Count; i++) {
++			TOOLINFOW ti = {};
++			ti.cbSize = sizeof(TOOLINFOW);
++			ti.uFlags = TTF_SUBCLASS;
++			ti.hwnd = hwndFormatBar;
++			ti.uId = static_cast<UINT_PTR>(i + 1);
++			ti.rect = FormatBar_ButtonRect(i);
++			ti.lpszText = const_cast<LPWSTR>(FormatBar_Tips[i]);
++			SendMessage(hwndFormatTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
++		}
++	}
++	return true;
++}
++
++static void FormatBar_Show() noexcept {
++	if (!FormatBar_IsActiveLexer() || SciCall_IsSelectionEmpty() || !FormatBar_Create()) {
++		FormatBar_Hide();
++		return;
++	}
++	const Sci_Position start = SciCall_GetSelectionStart();
++	const int lineHeight = SciCall_TextHeight();
++	POINT pt = { SciCall_PointXFromPosition(start), SciCall_PointYFromPosition(start) };
++
++	RECT client;
++	GetClientRect(hwndEdit, &client);
++	if (pt.y < 0 || pt.y > client.bottom) {
++		FormatBar_Hide();
++		return;
++	}
++	ClientToScreen(hwndEdit, &pt);
++
++	const int pad = FormatBar_Pad();
++	const int width = FormatBar_ButtonWidth() * FormatBtn_Count + pad * 2 + 2;
++	const int height = FormatBar_ButtonHeight() + pad * 2 + 2;
++	int x = pt.x;
++	int y = pt.y - height - MulDiv(4, static_cast<int>(FormatBar_Dpi()), 96);
++
++	const HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
++	MONITORINFO mi = { sizeof(MONITORINFO) };
++	GetMonitorInfo(hMonitor, &mi);
++	if (y < mi.rcWork.top) {
++		y = pt.y + lineHeight + MulDiv(4, static_cast<int>(FormatBar_Dpi()), 96);
++	}
++	if (x + width > mi.rcWork.right) {
++		x = mi.rcWork.right - width;
++	}
++	if (x < mi.rcWork.left) {
++		x = mi.rcWork.left;
++	}
++	SetWindowPos(hwndFormatBar, nullptr, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
++}
++
++static void FormatBar_OnTimer() noexcept {
++	KillTimer(hwndMain, ID_FORMATBARTIMER);
++	if (GetKeyState(VK_LBUTTON) < 0 || GetKeyState(VK_SHIFT) < 0) {
++		// ainda arrastando/selecionando: tenta novamente em seguida
++		SetTimer(hwndMain, ID_FORMATBARTIMER, 150, nullptr);
++		return;
++	}
++	if (GetForegroundWindow() != hwndMain) {
++		FormatBar_Hide();
++		return;
++	}
++	FormatBar_Show();
++}
++
++// chamado em SCN_UPDATEUI
++static void FormatBar_OnUpdateUI(unsigned updated) noexcept {
++	if (updated & (SC_UPDATE_TEXT | SC_UPDATE_V_SCROLL)) {
++		FormatBar_UpdateIndicators();
++	}
++	if (updated & (SC_UPDATE_SELECTION | SC_UPDATE_TEXT | SC_UPDATE_V_SCROLL)) {
++		if (SciCall_IsSelectionEmpty() || !FormatBar_IsActiveLexer()) {
++			KillTimer(hwndMain, ID_FORMATBARTIMER);
++			FormatBar_Hide();
++		} else {
++			SetTimer(hwndMain, ID_FORMATBARTIMER, 300, nullptr);
++		}
++	}
++}
++
++//=============================================================================
++// Colar imagem como Base64 (Markdown)
++//=============================================================================
++static const char Base64Table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static char *FormatBar_Base64(const BYTE *data, size_t length, size_t &outLen) noexcept {
++	const size_t prefixLen = 0;
++	char *out = static_cast<char *>(NP2HeapAlloc(((length + 2) / 3) * 4 + 1 + prefixLen));
++	if (out == nullptr) {
++		return nullptr;
++	}
++	char *p = out;
++	size_t i = 0;
++	for (; i + 2 < length; i += 3) {
++		const unsigned v = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
++		*p++ = Base64Table[(v >> 18) & 63];
++		*p++ = Base64Table[(v >> 12) & 63];
++		*p++ = Base64Table[(v >> 6) & 63];
++		*p++ = Base64Table[v & 63];
++	}
++	if (i + 1 == length) {
++		const unsigned v = data[i] << 16;
++		*p++ = Base64Table[(v >> 18) & 63];
++		*p++ = Base64Table[(v >> 12) & 63];
++		*p++ = '=';
++		*p++ = '=';
++	} else if (i + 2 == length) {
++		const unsigned v = (data[i] << 16) | (data[i + 1] << 8);
++		*p++ = Base64Table[(v >> 18) & 63];
++		*p++ = Base64Table[(v >> 12) & 63];
++		*p++ = Base64Table[(v >> 6) & 63];
++		*p++ = '=';
++	}
++	*p = '\0';
++	outLen = static_cast<size_t>(p - out);
++	return out;
++}
++
++struct FormatBarGdiplusStartupInput {
++	UINT32 GdiplusVersion;
++	void *DebugEventCallback;
++	BOOL SuppressBackgroundThread;
++	BOOL SuppressExternalCodecs;
++};
++
++// converte um DIB da area de transferencia em PNG usando GDI+ (carregado dinamicamente)
++static bool FormatBar_DibToPng(const BITMAPINFO *bmi, const void *bits, BYTE *&png, size_t &pngLen) noexcept {
++	typedef int (WINAPI *GdiplusStartupFn)(ULONG_PTR *, const FormatBarGdiplusStartupInput *, void *);
++	typedef void (WINAPI *GdiplusShutdownFn)(ULONG_PTR);
++	typedef int (WINAPI *GdipCreateBitmapFromGdiDibFn)(const BITMAPINFO *, void *, void **);
++	typedef int (WINAPI *GdipSaveImageToStreamFn)(void *, IStream *, const CLSID *, const void *);
++	typedef int (WINAPI *GdipDisposeImageFn)(void *);
++
++	HMODULE hGdip = LoadLibraryExW(L"gdiplus.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
++	if (hGdip == nullptr) {
++		return false;
++	}
++	const auto pStartup = reinterpret_cast<GdiplusStartupFn>(GetProcAddress(hGdip, "GdiplusStartup"));
++	const auto pShutdown = reinterpret_cast<GdiplusShutdownFn>(GetProcAddress(hGdip, "GdiplusShutdown"));
++	const auto pFromDib = reinterpret_cast<GdipCreateBitmapFromGdiDibFn>(GetProcAddress(hGdip, "GdipCreateBitmapFromGdiDib"));
++	const auto pSave = reinterpret_cast<GdipSaveImageToStreamFn>(GetProcAddress(hGdip, "GdipSaveImageToStream"));
++	const auto pDispose = reinterpret_cast<GdipDisposeImageFn>(GetProcAddress(hGdip, "GdipDisposeImage"));
++	bool result = false;
++	if (pStartup && pShutdown && pFromDib && pSave && pDispose) {
++		ULONG_PTR token = 0;
++		const FormatBarGdiplusStartupInput input = { 1, nullptr, FALSE, FALSE };
++		if (pStartup(&token, &input, nullptr) == 0) {
++			void *bitmap = nullptr;
++			if (pFromDib(bmi, const_cast<void *>(bits), &bitmap) == 0 && bitmap) {
++				IStream *stream = nullptr;
++				if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &stream))) {
++					// {557CF406-1A04-11D3-9A73-0000F81EF32E} = encoder PNG
++					static const CLSID clsidPng = { 0x557CF406, 0x1A04, 0x11D3, { 0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E } };
++					if (pSave(bitmap, stream, &clsidPng, nullptr) == 0) {
++						STATSTG stat = {};
++						if (SUCCEEDED(stream->Stat(&stat, STATFLAG_NONAME)) && stat.cbSize.QuadPart > 0) {
++							pngLen = static_cast<size_t>(stat.cbSize.QuadPart);
++							png = static_cast<BYTE *>(NP2HeapAlloc(pngLen));
++							if (png) {
++								LARGE_INTEGER zero = {};
++								ULONG read = 0;
++								stream->Seek(zero, STREAM_SEEK_SET, nullptr);
++								result = SUCCEEDED(stream->Read(png, static_cast<ULONG>(pngLen), &read)) && read == pngLen;
++								if (!result) {
++									NP2HeapFree(png);
++									png = nullptr;
++								}
++							}
++						}
++					}
++					stream->Release();
++				}
++				pDispose(bitmap);
++			}
++			pShutdown(token);
++		}
++	}
++	FreeLibrary(hGdip);
++	return result;
++}
++
++// Retorna true se a area de transferencia continha uma imagem (e ela foi inserida).
++static bool FormatBar_TryPasteImage() noexcept {
++	if (SciCall_GetReadOnly() || !IsClipboardFormatAvailable(CF_DIB)
++		|| IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_TEXT)) {
++		return false;
++	}
++	if (!OpenClipboard(hwndMain)) {
++		return false;
++	}
++	bool handled = false;
++	HGLOBAL hDib = static_cast<HGLOBAL>(GetClipboardData(CF_DIB));
++	if (hDib) {
++		const BITMAPINFO *bmi = static_cast<const BITMAPINFO *>(GlobalLock(hDib));
++		if (bmi) {
++			const BITMAPINFOHEADER &bih = bmi->bmiHeader;
++			size_t offset = bih.biSize;
++			if (bih.biBitCount <= 8) {
++				offset += (bih.biClrUsed ? bih.biClrUsed : (1U << bih.biBitCount)) * sizeof(RGBQUAD);
++			} else if (bih.biCompression == BI_BITFIELDS && bih.biSize == sizeof(BITMAPINFOHEADER)) {
++				offset += 3 * sizeof(DWORD);
++			}
++			BYTE *png = nullptr;
++			size_t pngLen = 0;
++			if (FormatBar_DibToPng(bmi, reinterpret_cast<const BYTE *>(bmi) + offset, png, pngLen)) {
++				size_t b64Len = 0;
++				char *b64 = FormatBar_Base64(png, pngLen, b64Len);
++				if (b64) {
++					static const char head[] = "![imagem](data:image/png;base64,";
++					const size_t total = sizeof(head) - 1 + b64Len + 2;
++					char *text = static_cast<char *>(NP2HeapAlloc(total));
++					if (text) {
++						memcpy(text, head, sizeof(head) - 1);
++						memcpy(text + sizeof(head) - 1, b64, b64Len);
++						text[sizeof(head) - 1 + b64Len] = ')';
++						SciCall_ReplaceSel(text);
++						NP2HeapFree(text);
++						handled = true;
++					}
++					NP2HeapFree(b64);
++				}
++				NP2HeapFree(png);
++			}
++			GlobalUnlock(hDib);
++		}
++	}
++	CloseClipboard();
++	return handled;
++}
+
+--- a/src/Notepad4.cpp	2026-10-23 21:04:16.205617619 +0000
++++ b/src/Notepad4.cpp	2026-10-23 21:04:16.376446318 +0000
+@@ -1100,6 +1100,8 @@
+ // Messages are distributed to the MsgXXX-handlers
+ //
+ //
++#include "FormatBar.h"
++
+ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT umsg, WPARAM wParam, LPARAM lParam) {
+ 	static bool bShutdownOK;
+ 
+@@ -1218,6 +1220,8 @@
+ 	case WM_TIMER:
+ 		if (wParam == ID_AUTOSAVETIMER) {
+ 			AutoSave_DoWork(FileSaveFlag_Default);
++		} else if (wParam == ID_FORMATBARTIMER) {
++			FormatBar_OnTimer();
+ 		}
+ 		break;
+ 
+@@ -1251,6 +1255,9 @@
+ 		break;
+ 
+ 	case WM_ACTIVATE:
++		if (LOWORD(wParam) == WA_INACTIVE) {
++			FormatBar_Hide();
++		}
+ 		if (bTransparentMode == TransparentMode_Inactive) {
+ 			SetWindowTransparentMode(hwnd, LOWORD(wParam) == WA_INACTIVE, iOpacityLevel);
+ 		}
+@@ -1789,6 +1796,8 @@
+ 	SciCall_SetEdgeColumn(iLongLinesLimitG);
+ 
+ 	// Margins
++	SciCall(SCI_SETMARGINLEFT, 0, 0); // sem margem esquerda do texto
++	SciCall(SCI_SETMARGINRIGHT, 0, 0);
+ 	SciCall_SetMarginSensitive(MarginNumber_Bookmark, true);
+ 	SciCall_SetMarginCursor(MarginNumber_Bookmark, SC_CURSORARROW);
+ 	SciCall_SetMarginType(MarginNumber_CodeFolding, SC_MARGIN_SYMBOL);
+@@ -3113,6 +3122,9 @@
+ 	case IDT_EDIT_PASTE:
+ 	case IDM_EDIT_PASTE:
+ 	//case IDM_EDIT_PASTE_BINARY:
++		if (LOWORD(wParam) == IDM_EDIT_PASTE && FormatBar_TryPasteImage()) {
++			break;
++		}
+ 		SciCall_Paste(LOWORD(wParam) == IDM_EDIT_PASTE_BINARY);
+ 		break;
+ 
+@@ -4651,6 +4663,7 @@
+ 		switch (pnmh->code) {
+ 		case SCN_UPDATEUI: {
+ 			const unsigned updated = scn->updated;
++			FormatBar_OnUpdateUI(updated);
+ 			if (updated & ~(SC_UPDATE_V_SCROLL | SC_UPDATE_H_SCROLL)) {
+ 				UpdateToolbar();
+ 				if (updated & SC_UPDATE_LINE_COUNT) {
+@@ -5218,8 +5231,8 @@
+ 	iZoomLevel = clamp(iValue, SC_MIN_ZOOM_LEVEL, SC_MAX_ZOOM_LEVEL);
+ 
+ 	bShowBookmarkMargin = section.GetBool(L"ShowBookmarkMargin", false);
+-	bShowLineNumbers = section.GetBool(L"ShowLineNumbers", true);
+-	bShowCodeFolding = section.GetBool(L"ShowCodeFolding", true);
++	bShowLineNumbers = section.GetBool(L"ShowLineNumbers", false);
++	bShowCodeFolding = section.GetBool(L"ShowCodeFolding", false);
+ 	iChangeHistoryMarker = section.GetInt(L"ChangeHistoryMarker", SC_CHANGE_HISTORY_DISABLED);
+ 	bMarkOccurrences = section.GetInt(L"MarkOccurrences", MarkOccurrences_Enable);
+ 
+@@ -5494,8 +5507,8 @@
+ 	section.SetIntEx(L"LongLineMode", iLongLineMode, EDGE_LINE);
+ 	section.SetIntEx(L"ZoomLevel", iZoomLevel, 100);
+ 	section.SetBoolEx(L"ShowBookmarkMargin", bShowBookmarkMargin, false);
+-	section.SetBoolEx(L"ShowLineNumbers", bShowLineNumbers, true);
+-	section.SetBoolEx(L"ShowCodeFolding", bShowCodeFolding, true);
++	section.SetBoolEx(L"ShowLineNumbers", bShowLineNumbers, false);
++	section.SetBoolEx(L"ShowCodeFolding", bShowCodeFolding, false);
+ 	section.SetIntEx(L"ChangeHistoryMarker", iChangeHistoryMarker, SC_CHANGE_HISTORY_DISABLED);
+ 	section.SetIntEx(L"MarkOccurrences", bMarkOccurrences, MarkOccurrences_Enable);
+ 	section.SetBoolEx(L"ViewWhiteSpace", bViewWhiteSpace, false);
